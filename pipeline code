@@ -1,0 +1,331 @@
+#!/bin/sh
+
+logdir=/home/cloudera/LFS/project_1/logs/
+basefile=`basename ${0}`
+currdate=`date +"%Y-%m-%d-%T"`
+logfile=${logdir}${basefile}_${currdate}.log
+
+exec >${logfile} 2>&1
+
+DATA_PATH=${1}
+
+if [ $# -ne 1 ]
+then 
+	echo "Provide Absolute Data Path" >> ${logfile}
+	exit 1
+fi
+
+# Initializing Variables
+PARAM_FILE=/home/cloudera/LFS/project_1/env/params.cfg
+
+# Sourcing Parameters
+. ${PARAM_FILE}
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "creating database ${DB_NAME}" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"CREATE DATABASE IF NOT EXISTS ${TB_NAME};"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "creating ${TB_NAME} table in mysql database ${DB_NAME}" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"CREATE TABLE IF NOT EXISTS ${DB_NAME}.${TB_NAME}(
+custid INTEGER PRIMARY KEY,
+username VARCHAR(100),
+quote_count INTEGER,
+ip VARCHAR(15),
+entry_time VARCHAR(100),
+prp_1 INTEGER,
+prp_2 INTEGER,
+prp_3 INTEGER,
+ms INTEGER,
+http_type VARCHAR(10), 
+purchase_category VARCHAR(100),
+total_count INTEGER,
+purchase_sub_category VARCHAR(100),
+http_info VARCHAR(500),
+status_code INTEGER,
+table_load_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+entry_date DATE,
+entry_year INTEGER,
+entry_month INTEGER
+);"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Trucating Mysql Table" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"TRUNCATE TABLE ${DB_NAME}.${TB_NAME}"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Loading Data into Mysql table from CSV file" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"LOAD DATA INFILE '${DATA_PATH}'
+INTO TABLE ${DB_NAME}.${TB_NAME}
+COLUMNS TERMINATED BY ','
+OPTIONALLY ENCLOSED BY '""'
+LINES TERMINATED BY '\n';"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Updating mysql columns" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"UPDATE ${DB_NAME}.${TB_NAME}
+SET entry_date = str_to_date(entry_time,'%d/%M/%Y'), 
+	entry_year = EXTRACT(YEAR from str_to_date(entry_time,'%d/%M/%Y')), 
+	entry_month = EXTRACT(MONTH from str_to_date(entry_time,'%d/%M/%Y'));"
+	
+# echo "------------------------------------------------------------------" >> ${logfile}
+# echo "Creating Sqoop Job to Import Mysql table to HDFS" >> ${logfile}
+# echo "------------------------------------------------------------------" >> ${logfile}
+# sqoop job --create managed_${TB_NAME}_inc_load -- import \
+# --connect jdbc:mysql://localhost:3306/${DB_NAME} \
+# --table ${DB_NAME}.managed_${TB_NAME} \
+# --username root \
+# --password-file file://${PASSWORD_FILE} \
+# --target-dir ${DFS_PATH}managed_${TB_NAME} \
+# --num-mappers 1 \
+# --incremental lastmodified --check-column table_load_date --last-value 1900-01-01-00:00:00 --merge-key custid
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating Hive database" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "create database if not exists ${DB_NAME};"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating Hive Table on Top of HDFS data imported using Sqoop" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "create table if not exists ${DB_NAME}.managed_${TB_NAME}
+(
+custid int,
+username string,
+quote_count int,
+ip string,
+entry_time string,
+prp_1 int,
+prp_2 int,
+prp_3 int,
+ms int,
+http_type string, 
+purchase_category string,
+total_count int,
+purchase_sub_category string,
+http_info string,
+status_code int,
+table_load_date timestamp,
+entry_date date,
+entry_year int,
+entry_month int
+)
+row format delimited fields terminated by ','
+location '${DFS_PATH}managed_${TB_NAME}';"
+
+
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating Sqoop Job to Import Mysql table to HDFS" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+
+sqoop job --show daily_data_inc_load
+
+if [ $? -ne 0 ]
+then
+	sqoop job --create daily_data_inc_load -- import \
+	--connect jdbc:mysql://localhost:3306/${DB_NAME} \
+	--table ${TB_NAME} \
+	--username root \
+	--password-file file://${PASSWORD_FILE} \
+	--target-dir ${DFS_PATH}managed_${TB_NAME} \
+	--num-mappers 1 \
+	--incremental append --check-column table_load_date --last-value 1900-01-01-00:00:00
+else
+	echo "Sqoop Job Exists"
+fi
+
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Running Sqoop Job to Import Mysql table to HDFS" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+sqoop job --exec daily_data_inc_load
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating External Table partitioned by Year and Month" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "create external table if not exists ${DB_NAME}.external_${TB_NAME}
+(
+custid int,
+username string,
+quote_count int,
+ip string,
+entry_time string,
+prp_1 int,
+prp_2 int,
+prp_3 int,
+ms int,
+http_type string, 
+purchase_category string,
+total_count int,
+purchase_sub_category string,
+http_info string,
+status_code int,
+table_load_date timestamp,
+entry_date date
+)
+partitioned by (entry_year int, entry_month int)
+row format delimited fields terminated by ','
+location '${DFS_PATH}external_${TB_NAME}';"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Importing data into External partitioned Table" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "set hive.exec.dynamic.partition.mode=nonstrict
+set hive.cli.print.header=true;
+set hive.support.concurrency=true;
+set hive.enforce.bucketing=true;
+set hive.exec.dynamic.partition.mode=nonstrict;
+set hive.compactor.initiator.on=true;
+set hive.compactor.worker.threads=1;
+set hive.txn.manager=org.apache.hadoop.hive.ql.lockmgr.DbTxnManager;
+
+INSERT OVERWRITE TABLE project1.external_daily_data 
+partition(entry_year, entry_month) 
+SELECT * FROM project1.managed_daily_data mdd WHERE mdd.table_load_date IN (SELECT MAX(table_load_date) FROM project1.managed_daily_data);"
+
+
+# INSERT OVERWRITE TABLE ${DB_NAME}.external_${TB_NAME} 
+# partition(entry_year, entry_month) 
+# SELECT CUSTID, USERNAME, QUOTE_COUNT, IP, ENTRY_TIME, PRP_1, PRP_2, PRP_3, MS, HTTP_TYPE, PURCHASE_CATEGORY, TOTAL_COUNT, PURCHASE_SUB_CATEGORY, HTTP_INFO, STATUS_CODE, table_load_date, entry_date, entry_year, entry_month FROM ${DB_NAME}.managed_${TB_NAME};"
+
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating Handler table" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "create table if not exists ${DB_NAME}.handler_${TB_NAME}
+(
+custid int,
+username string,
+quote_count int,
+ip string,
+entry_time string,
+prp_1 int,
+prp_2 int,
+prp_3 int,
+ms int,
+http_type string, 
+purchase_category string,
+total_count int,
+purchase_sub_category string,
+http_info string,
+status_code int,
+table_load_date timestamp,
+entry_date date,
+entry_year int,
+entry_month int
+)
+stored by 'org.apache.hadoop.hive.hbase.HBaseStorageHandler' 
+with SERDEPROPERTIES ('hbase.columns.mapping'=':key,cf:username, cf:quote_count, cf:ip, cf:entry_time, cf:prp_1, cf:prp_2, cf:prp_3, cf:ms, cf:http_type, cf:purchase_category, cf:total_count, cf:purchase_sub_category, cf:http_info, cf:status_code, cf:table_load_date, cf:entry_date, cf:entry_year, cf:entry_month')
+TBLPROPERTIES ('hbase.table.name'='${TB_NAME}','hbase.mapred.output.outputtable' = '${TB_NAME}');"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Inserting Data into Handler Table" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "insert overwrite table ${DB_NAME}.handler_${TB_NAME} select * from ${DB_NAME}.external_${TB_NAME};"
+
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating Pre-Master Table and Master Table in MySQL" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"CREATE TABLE IF NOT EXISTS ${DB_NAME}.master_tmp_${TB_NAME}(
+custid INTEGER PRIMARY KEY,
+username VARCHAR(100),
+quote_count INTEGER,
+ip VARCHAR(15),
+entry_time VARCHAR(100),
+prp_1 INTEGER,
+prp_2 INTEGER,
+prp_3 INTEGER,
+ms INTEGER,
+http_type VARCHAR(10), 
+purchase_category VARCHAR(100),
+total_count INTEGER,
+purchase_sub_category VARCHAR(100),
+http_info VARCHAR(500),
+status_code INTEGER,
+table_load_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+entry_date DATE,
+entry_year INTEGER,
+entry_month INTEGER
+);"
+
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"TRUNCATE TABLE ${DB_NAME}.master_tmp_${TB_NAME}"
+
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"CREATE TABLE IF NOT EXISTS ${DB_NAME}.master_${TB_NAME}(
+custid INTEGER PRIMARY KEY,
+username VARCHAR(100),
+quote_count INTEGER,
+ip VARCHAR(15),
+entry_time VARCHAR(100),
+prp_1 INTEGER,
+prp_2 INTEGER,
+prp_3 INTEGER,
+ms INTEGER,
+http_type VARCHAR(10), 
+purchase_category VARCHAR(100),
+total_count INTEGER,
+purchase_sub_category VARCHAR(100),
+http_info VARCHAR(500),
+status_code INTEGER,
+table_load_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+entry_date DATE,
+entry_year INTEGER,
+entry_month INTEGER
+);"
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Creating and importing data to Hive tmp Table to export data to MYSQL" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+hive -e "create table if not exists ${DB_NAME}.${TB_NAME}_mysql_export
+(
+custid int,
+username string,
+quote_count int,
+ip string,
+entry_time string,
+prp_1 int,
+prp_2 int,
+prp_3 int,
+ms int,
+http_type string, 
+purchase_category string,
+total_count int,
+purchase_sub_category string,
+http_info string,
+status_code int,
+table_load_date timestamp,
+entry_date date,
+entry_year int,
+entry_month int
+)
+row format delimited fields terminated by ','
+location '${DFS_PATH}${TB_NAME}_mysql_export';
+insert overwrite table ${DB_NAME}.${TB_NAME}_mysql_export select * from ${DB_NAME}.external_${TB_NAME}"
+
+
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Exporting data from External table to Mysql using Sqoop" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+sqoop export \
+--connect jdbc:mysql://localhost:3306/${DB_NAME} \
+--table master_tmp_${TB_NAME} --username root \
+--password-file file://${PASSWORD_FILE} \
+--export-dir ${DFS_PATH}${TB_NAME}_mysql_export
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Implementing SCD1 in Master Table" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
+mysql -uroot -p`cat ${PASSWORD_FILE}` -e"delete from ${DB_NAME}.master_${TB_NAME} where custid in (select custid from ${DB_NAME}.master_tmp_${TB_NAME});
+insert into ${DB_NAME}.master_${TB_NAME} select * from ${DB_NAME}.master_tmp_${TB_NAME};"
+
+
+echo "------------------------------------------------------------------" >> ${logfile}
+echo "Data Processing Completed" >> ${logfile}
+echo "------------------------------------------------------------------" >> ${logfile}
